@@ -1,0 +1,235 @@
+#! /usr/bin/env python3
+
+import socket
+import argparse
+import ssl
+from html.parser import HTMLParser
+
+
+def get_cookie(my_socket, host, uri):
+    """
+    Get cookies and csrf middleware token from the /accounts/login/ page. Note that The whole return message is returned
+    as the output, instead of the key information alone.
+    :param my_socket: a socket instance for the HTTPS connection.
+    :param host: a string that contains the host link to get information from.
+    :param uri: a string that contains the page link to get information from.
+    :return: a string that contains the full return message from the host server.
+    """
+    # send request
+    request_command = "GET {uri} HTTP/1.0\r\nhost: {host}\r\nconnection: keep-alive\r\n\r\n".format(uri=uri, host=host)
+    my_socket.sendall(request_command.encode(encoding="utf-8"))
+    # receive data
+    message = my_socket.recv(4096).decode(encoding="utf-8")
+    return message
+
+
+def post_request(my_socket, host, uri, sessionid, csrftoken, csrfmiddlewaretoken, username, password):
+    """
+    Post user information to log in to the host website. Note that a new session id and a new csrf token will be
+    generated after the login process. Users should use the previous csrf middleware token with the new ones instead.
+    :param my_socket: a socket instance for the HTTPS connection.
+    :param host: a string that contains the host link to get information from.
+    :param uri: a string that contains the page link to get information from.
+    :param sessionid: a string that contains the session id cookie to identify the user for current connection session.
+    :param csrftoken: a string that contains the csrf token cookie to identify the user for current connection session.
+    :param csrfmiddlewaretoken: a string that contains csrf middleware token to identify the user.
+    :param username: a string that contains the username of the user.
+    :param password: a string that contains the password of the user.
+    :return: a string that contains the whole return message from the host server.
+    """
+    # send request
+    content = "username={username}&password={password}".format(username=username, password=password)
+    content += "&csrfmiddlewaretoken={csrfmiddlewaretoken}".format(csrfmiddlewaretoken=csrfmiddlewaretoken)
+    content += "&next=/fakebook/"
+    content_length = str(len(content))
+    request_command = "POST {uri} HTTP/1.0\r\n".format(uri=uri)
+    request_command += "host: {host}\r\n".format(host=host)
+    request_command += "content-type: application/x-www-form-urlencoded\r\n"
+    request_command += "content-length: {content_length}\r\n".format(content_length=content_length)
+    request_command += "connection: keep-alive\r\nreferer: https://project2.5700.network/accounts/login/\r\n"
+    request_command += "cookie: csrftoken={csrftoken}".format(csrftoken=csrftoken)
+    request_command += "; sessionid={sessionid}\r\n\r\n".format(sessionid=sessionid)
+    request_command += "{content}\r\n".format(content=content)
+    my_socket.sendall(request_command.encode(encoding="utf-8"))
+    # receive data
+    message = my_socket.recv(4096).decode(encoding="utf-8")
+    return message
+
+
+def redirect_request(my_socket, host, uri, sessionid, csrftoken):
+    """
+    Redirect to a new uri after the log in process. Note that the user should use the new session id and the new csrf
+    token after the log in process.
+    :param my_socket: a socket instance for the HTTPS connection.
+    :param host: a string that contains the host link to get information from.
+    :param uri: a string that contains the new page link to go to.
+    :param sessionid: a string that contains the session id cookie to identify the user for current connection session.
+    :param csrftoken: a string that contains the csrf token cookie to identify the user for current connection session.
+    :return: a string that contains the whole return message from the host server.
+    """
+    # send request
+    request_command = "GET {uri} HTTP/1.0\r\nhost: {host}\r\n".format(uri=uri, host=host)
+    request_command += "referer: https://project2.5700.network/accounts/login/\r\nconnection: keep-alive\r\n"
+    request_command += "cookie: csrftoken={csrftoken}".format(csrftoken=csrftoken)
+    request_command += "; sessionid={sessionid}\r\n\r\n".format(sessionid=sessionid)
+    my_socket.sendall(request_command.encode(encoding="utf-8"))
+    # receive data
+    message = my_socket.recv(4096).decode(encoding="utf-8")
+    return message
+
+
+def message_parser(full_message):
+    """
+    Parse the full message received from the host server. A Python dictionary instance is returned as the output. It
+    contains the HTTP status, the csrf token, the session id, the new link after the redirection, and the content part
+    of the full message. Note that the value for the key will be an empty string if the full message does not include
+    such a key.
+    :param full_message: a string that contains the full message received from the host server.
+    :return: a Python dictionary instance for all key-value pairs mentioned above.
+    """
+    message_list = full_message.split("\r\n\r\n")
+    if len(message_list) == 2:
+        message_header = message_list[0]
+        message_content = message_list[1]
+        header_list = message_header.split("\r\n")
+        cookie_list = []
+        location = ''
+        sessionid = ''
+        csrftoken = ''
+        for header_item in header_list:
+            if "HTTP/1.1" in header_item:
+                http_status = header_item
+            if "Set-Cookie" in header_item:
+                cookie_list.append(header_item)
+            if "Location" in header_item:
+                location = header_item.split(": ")[1]
+        for cookie_item in cookie_list:
+            if "csrftoken" in cookie_item:
+                csrftoken = cookie_item.split("; ")[0].split('=')[1]
+            if "sessionid" in cookie_item:
+                sessionid = cookie_item.split("; ")[0].split('=')[1]
+    # parse messages with no header
+    elif len(message_list) == 1:
+        message_content = message_list[0]
+        http_status = ''
+        csrftoken = ''
+        sessionid = ''
+        location = ''
+    return {"http_status": http_status, "csrftoken": csrftoken, "sessionid": sessionid, "location": location,
+            "content": message_content}
+
+
+def main():
+    """
+    Execute the main working flow of the web crawler script. Only the secret flags will be printed as the output. Check
+    corresponding in-line comments for detailed explanation of each step.
+    :return: null. This function does not return anything.
+    """
+    # set socket client parameters
+    hostname = "project2.5700.network"
+    # 443 for https connection. for http, use 80 instead.
+    port = 443
+    # set commandline interface
+    parser = argparse.ArgumentParser(description="CS5700 Project 2")
+    # initiate a parser for the commandline command
+    parser.add_argument("username", nargs=1)
+    parser.add_argument("password", nargs=1)
+    # args contains a list of all arguments of the commandline command
+    args = parser.parse_args()
+    # create socket
+    context_instance = ssl.create_default_context()
+    my_socket = socket.create_connection((hostname, port))
+    my_ssocket = context_instance.wrap_socket(my_socket, server_hostname=hostname)
+    # connect to server
+    message1 = get_cookie(my_ssocket, hostname, '/accounts/login/')
+    # parse message1 to get csrftoken, sessionid and csrfmiddlewaretoken
+    msg_dict1 = message_parser(message1)
+    csrftoken = msg_dict1["csrftoken"]
+    sessionid = msg_dict1["sessionid"]
+    # create a TokenFinder class to find csrfmiddlewaretoken
+    content_list = []
+    csrfmiddlewaretoken = ""
+
+    class TokenFinder(HTMLParser):
+        def __init__(self):
+            super().__init__()
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "input":
+                for (attribute, value) in attrs:
+                    content_list.append((attribute, value))
+
+        def error(self, message):
+            pass
+    token_finder = TokenFinder()
+    token_finder.feed(msg_dict1["content"])
+    for i in range(len(content_list)):
+        (key, val) = content_list[i]
+        if (key == "name" and val == "csrfmiddlewaretoken"):
+            csrfmiddlewaretoken = content_list[i + 1][1]
+    # use information found in message1 to login
+    message2 = post_request(my_ssocket, hostname, "/accounts/login/?next=/fakebook/",
+                            sessionid, csrftoken, csrfmiddlewaretoken, args.username[0], args.password[0])
+    # obtain new csrftoken and new sessionid after login
+    msg_dict2 = message_parser(message2)
+    csrftoken2 = msg_dict2["csrftoken"]
+    sessionid2 = msg_dict2["sessionid"]
+    # set up a uri queue, a visited uri set and a flag set to collect flags
+    uri_queue = []
+    uri_visited = set([])
+    flag_set = set([])
+    # create a FlagFinder class to find all secret flags and collect them
+
+    class FlagFinder(HTMLParser):
+
+        def __init__(self):
+            super().__init__()
+            uri_visited.add("/")
+            uri_visited.add("/accounts/logout/")
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "a":
+                for (attribute, value) in attrs:
+                    if attribute == "href":
+                        if value not in uri_visited:
+                            uri_queue.append(value)
+
+        def handle_data(self, data):
+            if "FLAG: " in data:
+                flag_set.add(data)
+
+        def error(self, message):
+            pass
+    # initiate a FlagFinder to find flags
+    flag_finder = FlagFinder()
+    uri_queue.append("/fakebook/")
+    # handle all five kinds of HTTP status codes
+    while (len(uri_queue) > 0 and len(flag_set) < 5):
+        visiting_uri = uri_queue.pop(0)
+        message3 = redirect_request(my_ssocket, hostname, visiting_uri, sessionid2, csrftoken2)
+        msg_dict3 = message_parser(message3)
+        # mark current uri as visited and feed the content to the finder if 200
+        if "200" in msg_dict3["http_status"]:
+            uri_visited.add(visiting_uri)
+            flag_finder.feed(msg_dict3["content"])
+        # try to reconnect current uri again if 500, follow 200 if 500 disappeared
+        elif "500" in msg_dict3["http_status"]:
+            while "500" in msg_dict3["http_status"]:
+                message3 = redirect_request(my_ssocket, hostname, visiting_uri, sessionid2, csrftoken2)
+                msg_dict3 = message_parser(message3)
+            uri_visited.add(visiting_uri)
+            flag_finder.feed(msg_dict3["content"])
+        # mark current uri as visited if 403 or 404
+        elif "403" in msg_dict3["http_status"] or "404" in msg_dict3["http_status"]:
+            uri_visited.add(visiting_uri)
+        # mark current uri as visited and add the new redirected uri to the queue if 301
+        elif "301" in msg_dict3["http_status"]:
+            uri_visited.add(visiting_uri)
+            uri_queue.append(msg_dict3["location"])
+    # print all flag tokens without the header in the flag set
+    for flag in flag_set:
+        print(flag.split(": ")[1])
+
+
+if __name__ == "__main__":
+    main()
